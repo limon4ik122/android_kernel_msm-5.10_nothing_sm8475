@@ -26,8 +26,9 @@
 #include <linux/soc/qcom/irq.h>
 #include <linux/bitmap.h>
 #include <linux/sizes.h>
-#include <linux/debugfs.h>
-#include <trace/events/power.h>
+#include <linux/suspend.h>
+#include <linux/notifier.h>
+#include <linux/syscore_ops.h>
 
 #include "../core.h"
 #include "../pinconf.h"
@@ -83,6 +84,10 @@ struct msm_pinctrl {
 	const struct msm_pinctrl_soc_data *soc;
 	void __iomem *regs[MAX_NR_TILES];
 	u32 phys_base[MAX_NR_TILES];
+
+	struct msm_gpio_regs *gpio_regs;
+	struct msm_tile *msm_tile_regs;
+	bool hibernation;
 };
 
 static struct msm_pinctrl *msm_pinctrl_data;
@@ -118,6 +123,17 @@ MSM_ACCESSOR(io)
 MSM_ACCESSOR(intr_cfg)
 MSM_ACCESSOR(intr_status)
 MSM_ACCESSOR(intr_target)
+
+struct msm_gpio_regs {
+	u32 ctl_reg;
+	u32 io_reg;
+	u32 intr_cfg_reg;
+	u32 intr_status_reg;
+};
+
+struct msm_tile {
+	u32 dir_con_regs[8];
+};
 
 static void msm_ack_intr_status(struct msm_pinctrl *pctrl,
 				const struct msm_pingroup *g)
@@ -665,115 +681,6 @@ static void msm_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 
 #ifdef CONFIG_DEBUG_FS
 #include <linux/seq_file.h>
-#if IS_ENABLED(CONFIG_PINCTRL_MSM_S2IDLE_DUMP)
-
-static bool debug_suspend;
-static struct dentry *gpio_debugfs_suspend;
-static DEFINE_MUTEX(gpio_debug_lock);
-static void msm_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip);
-
-static void gpio_debug_suspend_trace_probe(void *unused,
-					const char *action, int val, bool start)
-{
-	struct gpio_chip chip = msm_pinctrl_data->chip;
-	if (start && val > 0 && !strcmp("machine_suspend", action)) {
-		mutex_lock(&gpio_debug_lock);
-		pr_info("[S2IDLE][GPIO] %s: %d pins\n",
-			chip.label, msm_pinctrl_data->soc->npins);
-		msm_gpio_dbg_show(NULL, &chip);
-		mutex_unlock(&gpio_debug_lock);
-	}
-}
-
-static int gpio_debug_suspend_enable_get(void *data, u64 *val)
-{
-	*val = debug_suspend;
-
-	return 0;
-}
-
-static int gpio_debug_suspend_enable_set(void *data, u64 val)
-{
-	int ret;
-
-	val = !!val;
-	if (val == debug_suspend)
-		return 0;
-
-	if (val)
-		ret = register_trace_suspend_resume(
-			gpio_debug_suspend_trace_probe, NULL);
-	else
-		ret = unregister_trace_suspend_resume(
-			gpio_debug_suspend_trace_probe, NULL);
-	if (ret) {
-		pr_err("%s: Failed to %sregister suspend trace callback, ret=%d\n",
-			__func__, val ? "" : "un", ret);
-		return ret;
-	}
-	debug_suspend = val;
-
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(gpio_debug_suspend_enable_fops,
-	gpio_debug_suspend_enable_get, gpio_debug_suspend_enable_set, "%llu\n");
-
-static void msm_pinctrl_s2idle_debug(struct platform_device *pdev, bool init)
-{
-	static struct dentry *rootdir = NULL;
-	int ret = 0;
-
-	if (!init) {
-		debugfs_remove(gpio_debugfs_suspend);
-		if (debug_suspend)
-			unregister_trace_suspend_resume(
-					gpio_debug_suspend_trace_probe, NULL);
-		return;
-	}
-
-	rootdir = debugfs_lookup("pinctrl", NULL);
-	if (IS_ERR_OR_NULL(rootdir)) {
-		ret = PTR_ERR(rootdir);
-		pr_err("%s: unable to find root pinctrl %s debugfs directory, ret=%d\n",
-			__func__, dev_name(&pdev->dev), ret);
-		return;
-	}
-
-	gpio_debugfs_suspend = debugfs_create_file_unsafe("tlmm_debug_suspend",
-						0644, rootdir, NULL,
-						&gpio_debug_suspend_enable_fops);
-
-	dput(rootdir);
-	if (IS_ERR(gpio_debugfs_suspend)) {
-		ret = PTR_ERR(gpio_debugfs_suspend);
-		pr_err("%s: unable to create %s debug_suspend debugfs directory, ret=%d\n",
-			__func__, dev_name(&pdev->dev), ret);
-	}
-}
-
-static void s2idle_gpio_dump(const char *fmt, ...)
-{
-	va_list args;
-	static unsigned char tmp[150];
-	static unsigned char *s = tmp;
-	unsigned char *e = tmp + 150;
-	int n = 0;
-	if (s >= e){
-		pr_info("[S2IDLE][GPIO]: oem_info error.\n");
-		return;
-	}
-	va_start(args, fmt);
-	n = vsnprintf(s, INT_MAX,fmt, args);
-	va_end(args);
-	if (n >= 0)
-		s += n;
-	if (fmt[0] == '\n'){
-		pr_info("%s", tmp);
-		s = tmp;
-		return;
-	}
-}
-#endif /* CONFIG_PINCTRL_MSM_S2IDLE_DUMP */
 
 static void msm_gpio_dbg_show_one(struct seq_file *s,
 				  struct pinctrl_dev *pctldev,
@@ -819,9 +726,7 @@ static void msm_gpio_dbg_show_one(struct seq_file *s,
 		val = !!(io_reg & BIT(g->out_bit));
 	else
 		val = !!(io_reg & BIT(g->in_bit));
-#if IS_ENABLED(CONFIG_PINCTRL_MSM_S2IDLE_DUMP)
-	if (s){
-#endif /* CONFIG_PINCTRL_MSM_S2IDLE_DUMP */
+
 	seq_printf(s, " %-8s: %-3s", g->name, is_out ? "out" : "in");
 	seq_printf(s, " %-4s func%d", val ? "high" : "low", func);
 	seq_printf(s, " %dmA", msm_regval_to_drive(drive));
@@ -830,18 +735,6 @@ static void msm_gpio_dbg_show_one(struct seq_file *s,
 	else
 		seq_printf(s, " %s", pulls_keeper[pull]);
 	seq_puts(s, "\n");
-#if IS_ENABLED(CONFIG_PINCTRL_MSM_S2IDLE_DUMP)
-	} else {
-		s2idle_gpio_dump(" %-8s: %-3s", g->name, is_out ? "out" : "in");
-		s2idle_gpio_dump(" %-4s func%d", val ? "high" : "low", func);
-		s2idle_gpio_dump(" %dmA", msm_regval_to_drive(drive));
-		if (pctrl->soc->pull_no_keeper)
-				s2idle_gpio_dump(" %s", pulls_no_keeper[pull]);
-		else
-				s2idle_gpio_dump(" %s", pulls_keeper[pull]);
-		s2idle_gpio_dump("\n");
-	}
-#endif /* CONFIG_PINCTRL_MSM_S2IDLE_DUMP */
 }
 
 static void msm_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip)
@@ -1611,6 +1504,147 @@ static void msm_pinctrl_setup_pm_reset(struct msm_pinctrl *pctrl)
 		}
 }
 
+#ifdef CONFIG_HIBERNATION
+static int pinctrl_hibernation_notifier(struct notifier_block *nb,
+								unsigned long event, void *dummy)
+{
+	struct msm_pinctrl *pctrl = msm_pinctrl_data;
+	const struct msm_pinctrl_soc_data *soc = pctrl->soc;
+
+	if (event == PM_HIBERNATION_PREPARE) {
+		pctrl->gpio_regs = kcalloc(soc->ngroups,
+			sizeof(*pctrl->gpio_regs), GFP_KERNEL);
+		if (pctrl->gpio_regs == NULL)
+			return -ENOMEM;
+		if (soc->ntiles) {
+			pctrl->msm_tile_regs = kcalloc(soc->ntiles,
+				sizeof(*pctrl->msm_tile_regs), GFP_KERNEL);
+			if (pctrl->msm_tile_regs == NULL) {
+				kfree(pctrl->gpio_regs);
+				return -ENOMEM;
+			}
+		}
+		pctrl->hibernation = true;
+	} else if (event == PM_POST_HIBERNATION) {
+		kfree(pctrl->gpio_regs);
+		kfree(pctrl->msm_tile_regs);
+		pctrl->gpio_regs = NULL;
+		pctrl->msm_tile_regs = NULL;
+		pctrl->hibernation = false;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block pinctrl_notif_block = {
+	.notifier_call = pinctrl_hibernation_notifier,
+};
+
+static int msm_pinctrl_hibernation_suspend(void)
+{
+	const struct msm_pingroup *pgroup;
+	struct msm_pinctrl *pctrl = msm_pinctrl_data;
+	const struct msm_pinctrl_soc_data *soc = pctrl->soc;
+	void __iomem *tile_addr = NULL;
+	u32 i, j;
+
+	if (likely(!pctrl->hibernation))
+		return 0;
+
+    /* Save direction conn registers for hmss */
+
+	for (i = 0; i < soc->ntiles; i++) {
+		if (soc->tiles)
+			tile_addr = pctrl->regs[i] + soc->dir_conn_addr[i];
+
+		else
+			tile_addr = pctrl->regs[0] + soc->dir_conn_addr[i];
+
+		pr_err("The tile addr generated is 0x%lx\n", (u64)tile_addr);
+		for (j = 0; j < 8; j++)
+			pctrl->msm_tile_regs[i].dir_con_regs[j] =
+				readl_relaxed(tile_addr + j*4);
+	}
+
+	/* All normal gpios will have common registers, first save them */
+	for (i = 0; i < soc->ngpios; i++) {
+		pgroup = &soc->groups[i];
+		pctrl->gpio_regs[i].ctl_reg =
+				msm_readl_ctl(pctrl, pgroup);
+		pctrl->gpio_regs[i].io_reg =
+				msm_readl_io(pctrl, pgroup);
+
+		if (pgroup->intr_cfg_reg)
+			pctrl->gpio_regs[i].intr_cfg_reg =
+				msm_readl_intr_cfg(pctrl, pgroup);
+
+		if (pgroup->intr_status_reg)
+			pctrl->gpio_regs[i].intr_status_reg =
+				msm_readl_intr_status(pctrl, pgroup);
+	}
+
+	for ( ; i < soc->ngroups; i++) {
+		pgroup = &soc->groups[i];
+		if (pgroup->ctl_reg)
+			pctrl->gpio_regs[i].ctl_reg =
+					msm_readl_ctl(pctrl, pgroup);
+		if (pgroup->io_reg)
+			pctrl->gpio_regs[i].io_reg =
+					msm_readl_io(pctrl, pgroup);
+	}
+	return 0;
+}
+
+static void msm_pinctrl_hibernation_resume(void)
+{
+	u32 i, j;
+	const struct msm_pingroup *pgroup;
+	struct msm_pinctrl *pctrl = msm_pinctrl_data;
+	const struct msm_pinctrl_soc_data *soc = pctrl->soc;
+	void __iomem *tile_addr = NULL;
+
+	if (likely(!pctrl->hibernation) || !pctrl->gpio_regs || !pctrl->msm_tile_regs)
+		return;
+	for (i = 0; i < soc->ntiles; i++) {
+		if (soc->tiles)
+			tile_addr = pctrl->regs[i] + soc->dir_conn_addr[i];
+		else
+			tile_addr = pctrl->regs[0] + soc->dir_conn_addr[i];
+		pr_err("The tile addr generated is 0x%lx\n", (u64)tile_addr);
+		for (j = 0; j < 8; j++)
+			writel_relaxed(pctrl->msm_tile_regs[i].dir_con_regs[j],
+					tile_addr + j*4);
+	}
+
+    /* Restore normal gpios */
+	for (i = 0; i < soc->ngpios; i++) {
+		pgroup = &soc->groups[i];
+		msm_writel_ctl(pctrl->gpio_regs[i].ctl_reg, pctrl, pgroup);
+		msm_writel_io(pctrl->gpio_regs[i].io_reg, pctrl, pgroup);
+		if (pgroup->intr_cfg_reg)
+			msm_writel_intr_cfg(pctrl->gpio_regs[i].intr_cfg_reg,
+				pctrl, pgroup);
+		if (pgroup->intr_status_reg)
+			msm_writel_intr_status(pctrl->gpio_regs[i].intr_status_reg,
+					pctrl, pgroup);
+	}
+
+	for ( ; i < soc->ngroups; i++) {
+		pgroup = &soc->groups[i];
+		if (pgroup->ctl_reg)
+			msm_writel_ctl(pctrl->gpio_regs[i].ctl_reg,
+					pctrl, pgroup);
+		if (pgroup->io_reg)
+			msm_writel_io(pctrl->gpio_regs[i].io_reg,
+					pctrl, pgroup);
+	}
+}
+
+static struct syscore_ops msm_pinctrl_pm_ops = {
+	.suspend = msm_pinctrl_hibernation_suspend,
+	.resume = msm_pinctrl_hibernation_resume,
+};
+#endif
+
 static __maybe_unused int msm_pinctrl_suspend(struct device *dev)
 {
 	struct msm_pinctrl *pctrl = dev_get_drvdata(dev);
@@ -1756,6 +1790,7 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 	if (!pctrl)
 		return -ENOMEM;
 
+	pctrl->hibernation = false;
 	pctrl->dev = &pdev->dev;
 	pctrl->soc = soc_data;
 	pctrl->chip = msm_gpio_template;
@@ -1813,9 +1848,12 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 
 	platform_set_drvdata(pdev, pctrl);
 
-#if IS_ENABLED(CONFIG_PINCTRL_MSM_S2IDLE_DUMP)
-	msm_pinctrl_s2idle_debug(pdev, true);
-#endif /* CONFIG_PINCTRL_MSM_S2IDLE_DUMP */
+#ifdef CONFIG_HIBERNATION
+	register_syscore_ops(&msm_pinctrl_pm_ops);
+	ret = register_pm_notifier(&pinctrl_notif_block);
+	if (ret)
+		return ret;
+#endif
 
 	dev_dbg(&pdev->dev, "Probed Qualcomm pinctrl driver\n");
 
@@ -1826,10 +1864,6 @@ EXPORT_SYMBOL(msm_pinctrl_probe);
 int msm_pinctrl_remove(struct platform_device *pdev)
 {
 	struct msm_pinctrl *pctrl = platform_get_drvdata(pdev);
-
-#if IS_ENABLED(CONFIG_PINCTRL_MSM_S2IDLE_DUMP)
-	msm_pinctrl_s2idle_debug(pdev, false);
-#endif /* CONFIG_PINCTRL_MSM_S2IDLE_DUMP */
 
 	gpiochip_remove(&pctrl->chip);
 
